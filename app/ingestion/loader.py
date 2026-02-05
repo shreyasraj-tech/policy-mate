@@ -1,168 +1,214 @@
-from docling.document_converter import DocumentConverter
+"""Document ingestion and vector store helpers for Policy Mate.
+
+Provides:
+ - PDF text extraction (lazy imports)
+ - Chunking using `utils.splitter.semantic_split` (defaults tuned for policy docs)
+ - Cached embeddings and vector store creation
+ - MMR retriever helper (diverse retrieval)
+
+Functions are designed for programmatic use; module has no side-effects on import.
+"""
+
+from functools import lru_cache
+from typing import List, Optional
+import os
 import requests
-import io
-import pdfplumber as pp
 import logging
 
-import re
-import os
-from pinecone import Pinecone
-from dotenv import load_dotenv
+from langchain_core.documents import Document as LangChainDocument
 
-load_dotenv()
- 
+from utils.splitter import semantic_split
+
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def clean_address_text(text):
+
+def load_pdf_text(url: str, timeout: int = 15) -> str:
+    """Download and extract text from a PDF URL using PyMuPDF (lazy import).
+
+    Args:
+        url: Public URL to the PDF document.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        Full extracted text as a single string.
     """
-    Clean address text using regex patterns
+    try:
+        import fitz  # PyMuPDF (lazy)
+    except Exception:
+        raise RuntimeError("PyMuPDF (fitz) is required for PDF extraction")
+
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    doc = fitz.open(stream=r.content, filetype="pdf")
+    pages = []
+    for p in doc:
+        pages.append(p.get_text())
+    doc.close()
+    return "\n".join(pages)
+
+
+def split_text_to_documents(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[LangChainDocument]:
+    """Split text into a list of LangChain `Document` objects using the
+    policy-aware `semantic_split`.
+
+    Args:
+        text: Input document text.
+        chunk_size: Target chunk size (characters; ~tokens).
+        chunk_overlap: Overlap length between chunks.
+
+    Returns:
+        List of `langchain_core.documents.Document` instances.
     """
-    # Remove extra whitespace and normalize
-    text = re.sub(r'\s+', ' ', text.strip())
-    
-    # Remove common address patterns that might be redundant
-    text = re.sub(r'Premises No\.\s*\d+[-\d]*', '\n', text)
-    text = re.sub(r'Plot no\.\s*[A-Z]+-\d+', '\n', text)
-    
-    # Clean up multiple commas and spaces
-    text = re.sub(r',\s*,', ',', text)
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Remove leading/trailing commas and spaces
-    text = re.sub(r'^[,\s]+', '', text)
-    text = re.sub(r'[,\s]+$', '', text)
-    
-    return text.strip()
+    chunks = semantic_split(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    docs = [LangChainDocument(page_content=chunk) for chunk in chunks]
+    return docs
 
 
-def filter_insurance_text(obj):  
-    if obj["object_type"] == "char":  
-        unwanted_text = "National Insurance Co. Ltd. Premises No. 18-0374, Plot no. CBD-81, New Town, Kolkata - 700156"  
-        if obj["text"].strip().lower() in unwanted_text.lower():  
-            return False  
-    return True  
+@lru_cache(maxsize=4)
+def get_embeddings_provider(provider: str = "cohere", model: Optional[str] = None):
+    """Return a cached embeddings provider instance.
 
-class DocLoader:
-    def __init__(self, file_link: str):
-        self.file_link = file_link
-        self.docling_document_converter = DocumentConverter()
+    Currently supports `cohere`, `ollama`, and `openai` (fallback).
+    """
+    if provider == "cohere":
+        try:
+            from langchain_cohere import CohereEmbeddings
+            model = model or os.getenv("COHERE_MODEL", "embed-v4.0")
+            return CohereEmbeddings(model=model)
+        except Exception:
+            logger.warning("CohereEmbeddings not available; falling back")
 
-    def docling_load(self):
-        return self.docling_document_converter.convert(self.file_link)
+    if provider == "ollama":
+        try:
+            from langchain_ollama import OllamaEmbeddings
+            model = model or "all-minilm:33m"
+            return OllamaEmbeddings(model=model)
+        except Exception:
+            logger.warning("OllamaEmbeddings not available; falling back")
 
-    def pdf_plumber_load(self):
-        pdf = requests.get(self.file_link)
-        with pp.open(io.BytesIO(pdf.content)) as pdf:
-            return pdf.pages
-
-
-
-file_link = "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D"
-
-
-
-# Extract the signature key
-a = file_link.split("sig=")
-sig_key = a[1]
-print(f"Signature Key: {sig_key}")
-
-
-# doc_loader = DocLoader(file_link).docling_load()
-doc_loader = DocLoader(file_link).pdf_plumber_load()
+    # Default: OpenAI-compatible embeddings
+    try:
+        from langchain_openai import OpenAIEmbeddings
+        model = model or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        return OpenAIEmbeddings(model=model)
+    except Exception:
+        raise RuntimeError("No available embeddings provider (install Cohere, Ollama, or OpenAI embeddings)")
 
 
-data = ""
-for page in doc_loader:
-    doc = page.extract_text(layout=True)
-    #filtered_doc =  page.filter(filter_insurance_text)
-    # Clean the extracted text
-    #cleaned_doc = clean_address_text(doc)
-    data += doc
+@lru_cache(maxsize=4)
+def get_vectorstore_from_index(index_name: str, namespace: Optional[str], embeddings_provider) -> object:
+    """Load an existing Pinecone/compatible vector store pointing at an index.
 
-# data = doc_loader.document.export_to_text()
-
-with open("agentic_doc_output.txt", "w") as f:
-    f.write(data)
-
-# print(doc_loader.load().pages)
-
-
-
-
-
-# pc = PineconeVectorStore(index_name="hackrxn")
-
-# pc.add_documents(data)
-
-# from openai import OpenAI
-
-# client = OpenAI(
-#     base_url="https://api.cohere.ai/compatibility/v1",
-#     api_key=os.getenv("COHERE_API_KEY"),
-# )
-
-# response = client.embeddings.create(
-#     input=[data],
-#     model="embed-v4.0",
-#     encoding_format="float",
-# )
+    Returns a vector store instance (implementation-opaque).
+    """
+    try:
+        from langchain_pinecone import PineconeVectorStore
+        return PineconeVectorStore.from_existing_index(
+            embedding=embeddings_provider,
+            index_name=index_name,
+            namespace=namespace,
+        )
+    except Exception:
+        # Fallback: raise descriptive error
+        raise RuntimeError("PineconeVectorStore not available or index not found")
 
 
-# print(len(response.data[0].embedding))
+def mmr_select(docs, query_embedding, doc_embeddings, k: int = 5) -> List[LangChainDocument]:
+    """Perform a simple greedy Maximal Marginal Relevance selection.
+
+    Args:
+        docs: list of Document objects (candidates)
+        query_embedding: embedding vector of the query
+        doc_embeddings: list of embedding vectors corresponding to docs
+        k: number of documents to select
+
+    Returns:
+        Selected subset of `docs` (ordered)
+    """
+    import numpy as np
+
+    def cosine(a, b):
+        a = np.array(a)
+        b = np.array(b)
+        if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+            return 0.0
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+    selected = []
+    if not docs:
+        return []
+
+    # Precompute similarities
+    sim_to_query = [cosine(query_embedding, emb) for emb in doc_embeddings]
+    remaining = set(range(len(docs)))
+
+    # Pick highest scoring doc first
+    first = int(max(remaining, key=lambda i: sim_to_query[i]))
+    selected.append(first)
+    remaining.remove(first)
+
+    while len(selected) < min(k, len(docs)) and remaining:
+        best_score = None
+        best_idx = None
+        for idx in remaining:
+            # compute marginal relevance = lambda * sim(query, doc) - (1-lambda) * max_sim_to_selected
+            lambda_param = 0.7
+            sim_q = sim_to_query[idx]
+            max_sim_to_selected = max(cosine(doc_embeddings[idx], doc_embeddings[s]) for s in selected)
+            mmr_score = lambda_param * sim_q - (1 - lambda_param) * max_sim_to_selected
+            if best_score is None or mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = idx
+        if best_idx is None:
+            break
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    return [docs[i] for i in selected]
 
 
-from langchain_cohere import CohereEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+def mmr_retrieve(vector_store, embeddings_provider, query: str, k: int = 5, fetch_k: int = 20) -> List[LangChainDocument]:
+    """Retrieve documents using MMR to promote diversity.
 
-os.environ["COHERE_API_KEY"] = os.getenv("COHERE_API_KEY")
-MODEL = "embed-v4.0"
+    Args:
+        vector_store: Vector store instance with `similarity_search_with_score` method.
+        embeddings_provider: Embeddings provider with `embed_query` method.
+        query: Query string.
+        k: Number of final results to return.
+        fetch_k: Number of candidate documents to fetch before MMR selection.
+    """
+    # Step 1: fetch candidate documents with scores
+    try:
+        candidates = vector_store.similarity_search_with_score(query, k=fetch_k)
+    except Exception:
+        # fallback to simple similarity_search
+        candidates = [(d, 0.0) for d in vector_store.similarity_search(query, k=fetch_k)]
 
-embeddings = CohereEmbeddings(model=MODEL)
+    docs = [d for d, _ in candidates]
 
-text_spliter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    if not docs:
+        return []
 
-chunks = text_spliter.split_text(data)
-#print(chunks)
+    # Step 2: compute embeddings for query and docs (try to use provider methods)
+    try:
+        query_emb = embeddings_provider.embed_query(query)
+    except Exception:
+        # Try naming differences (cohere/OpenAI)
+        try:
+            query_emb = embeddings_provider.embed_documents([query])[0]
+        except Exception:
+            raise RuntimeError("Embeddings provider does not support embedding queries")
 
-print(len(chunks))
-#print(chunks[0])
+    doc_texts = [d.page_content for d in docs]
+    try:
+        doc_embs = embeddings_provider.embed_documents(doc_texts)
+    except Exception:
+        # If embedding whole docs fails, embed first 512 chars
+        doc_embs = embeddings_provider.embed_documents([t[:1024] for t in doc_texts])
 
-from langchain_pinecone import PineconeVectorStore
-from langchain_core.documents import Document
+    selected = mmr_select(docs, query_emb, doc_embs, k=k)
+    return selected
 
-# Convert strings to Document objects
-documents = [Document(page_content=chunk) for chunk in chunks]
-
-# Create Pinecone vector store with embeddings
-pc = PineconeVectorStore.from_existing_index(
-    #documents=documents,
-    embedding=embeddings,
-    index_name="policy-store",
-    namespace=sig_key
-)
-
-print("Documents successfully added to Pinecone!")
-
-# Create retriever without reranker
-retriever = pc.similarity_search("What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?", k=20)
-
-# Test the retriever
-try:
-    #results = retriever.invoke("What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?")
-    print("Retrieval results:")
-    for i, doc in enumerate(retriever):
-        print(f"Document {i+1}: {doc.page_content[:200]}...")
-except Exception as e:
-    print(f"Error during retrieval: {e}")
-
-
-# TODO: 
-# 0. retrive the existing namespace if it exists pass one if not create one and add the documents to the namespace
-# 1. Add a rerank
-# 2. Add a semantic search
-# 3. Add a vector store
-# 4. Add a retriever
-# 5. Add a query engine
-# 6. Add a chain
 
 

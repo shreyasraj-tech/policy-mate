@@ -31,12 +31,30 @@ def get_hybrid_retriever(vector_store: DocArrayInMemorySearch, chunks: List[Docu
     bm25_retriever = BM25Retriever.from_documents(chunks)
     bm25_retriever.k = k
 
-    # Initialize DocArrayInMemorySearch retriever for dense retrieval with cosine similarity
-    # The search_type and search_kwargs ensure we use the configured cosine similarity
-    vector_retriever = vector_store.as_retriever(
-        search_type="similarity", 
-        search_kwargs={"k": k}
-    )
+    # Initialize dense retriever using Maximal Marginal Relevance (MMR) when available
+    try:
+        # Preferred: LangChain MaxMarginalRelevanceRetriever
+        from langchain.retrievers import MaxMarginalRelevanceRetriever
+
+        vector_retriever = MaxMarginalRelevanceRetriever.from_retriever(
+            vector_store.as_retriever(search_type="similarity", search_kwargs={"k": k * 4}),
+            fetch_k=k * 4,
+            k=k,
+            lambda_mult=0.7,
+        )
+    except Exception:
+        try:
+            # Some vectorstores support mmr directly via as_retriever
+            vector_retriever = vector_store.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": k, "fetch_k": k * 4, "lambda_mult": 0.7}
+            )
+        except Exception:
+            # Fallback to standard similarity retriever
+            vector_retriever = vector_store.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": k}
+            )
 
     # Initialize Ensemble Retriever
     ensemble_retriever = EnsembleRetriever(

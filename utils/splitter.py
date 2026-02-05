@@ -18,39 +18,36 @@ def split_into_clauses(text: str) -> list:
         if clause:
             clauses.append(clause)
     return clauses
-"""
-Optimized semantic text splitter utility for efficient chunking of documents
-Enhanced with multiple chunking strategies and intelligent fallbacks
+"""utils.splitter
+Refined chunking utilities for policy documents.
+
+This module provides multiple chunking strategies with sensible defaults
+for legal/policy documents. Defaults aim for ~1000-token chunks with
+200-token overlap.
 """
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_ollama import OllamaEmbeddings
-from langchain_openai import OpenAIEmbeddings
-from langchain_core.documents import Document as LangChainDocument
-from typing import List, Dict, Any, Optional
+from typing import List
 import logging
 import time
 import re
 
-# Import enhanced chunking framework
-try:
-    from .enhanced_chunking import (
-        EnhancedChunkingFramework, 
-        ChunkingConfig, 
-        ChunkingStrategy,
-        adaptive_split as enhanced_adaptive_split,
-        policy_aware_split,
-        hierarchical_split
-    )
-    ENHANCED_CHUNKING_AVAILABLE = True
-except ImportError:
-    ENHANCED_CHUNKING_AVAILABLE = False
-    logging.warning("Enhanced chunking framework not available, falling back to basic chunking")
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document as LangChainDocument
 
 logger = logging.getLogger(__name__)
 
-def fast_rule_based_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
+# Try to import enhanced chunking helpers if available, otherwise set flags
+try:
+    from .enhanced_chunking import (
+        adaptive_split as enhanced_adaptive_split,
+        policy_aware_split,
+        hierarchical_split,
+    )
+    ENHANCED_CHUNKING_AVAILABLE = True
+except Exception:
+    ENHANCED_CHUNKING_AVAILABLE = False
+
+def fast_rule_based_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
     """
     Fast rule-based splitting optimized for policy documents
     Uses document structure and patterns for intelligent chunking
@@ -58,28 +55,14 @@ def fast_rule_based_split(text: str, chunk_size: int = 1000, chunk_overlap: int 
     logger.info("Using fast rule-based chunking...")
     
     # Define policy document separators in order of priority
-    separators = [
-        "\n\n\n",  # Major section breaks
-        "\n\n",    # Paragraph breaks
-        "\n• ",    # Bullet points
-        "\n- ",    # Dash points
-        r"\n\d+\.", # Numbered points
-        ". ",      # Sentence boundaries
-        "! ",      # Exclamation boundaries
-        "? ",      # Question boundaries
-        "; ",      # Semicolon boundaries
-        ", ",      # Comma boundaries
-        " ",       # Space boundaries
-        ""         # Character boundaries
-    ]
+    # Context-aware separators optimized for policy/legal documents
+    separators = ["\n\n", "\n", "Article", "Section", "Clause", ".", " "]
     
     # Create optimized text splitter
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=separators,
-        length_function=len,
-        is_separator_regex=False,
     )
     
     chunks = text_splitter.split_text(text)
@@ -96,7 +79,7 @@ def fast_rule_based_split(text: str, chunk_size: int = 1000, chunk_overlap: int 
     logger.info(f"Fast rule-based chunking complete: {len(processed_chunks)} chunks created")
     return processed_chunks
 
-def smart_policy_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
+def smart_policy_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
     """
     Smart policy document splitting that preserves important structure
     """
@@ -143,9 +126,19 @@ def smart_policy_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 1
     logger.info(f"Smart policy chunking complete: {len(chunks)} chunks created")
     return chunks
 
-def semantic_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
-    """
-    Enhanced semantic chunking with multiple strategies and intelligent fallbacks
+def semantic_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    """Main entrypoint for chunking policy documents.
+
+    Tries several strategies (policy-aware, semantic, fallback) and returns
+    a list of cleaned chunks.
+
+    Args:
+        text: Full document text.
+        chunk_size: Target chunk size (characters; ~tokens).
+        chunk_overlap: Overlap between chunks.
+
+    Returns:
+        List[str]: Ordered list of text chunks.
     """
     start_time = time.time()
     
@@ -155,27 +148,6 @@ def semantic_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) 
         return [text.strip()]
     
     # Try enhanced chunking framework first if available
-    if ENHANCED_CHUNKING_AVAILABLE:
-        try:
-            logger.info("Using enhanced chunking framework with adaptive strategy")
-            config = ChunkingConfig(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                strategy=ChunkingStrategy.ADAPTIVE,
-                timeout_seconds=15
-            )
-            framework = EnhancedChunkingFramework(config)
-            result = framework.chunk_document(text)
-            
-            chunks = result['chunks']
-            if chunks and len(chunks) > 0:
-                elapsed = time.time() - start_time
-                logger.info(f"Enhanced chunking succeeded: {len(chunks)} chunks in {elapsed:.2f}s")
-                logger.info(f"Quality metrics: {result.get('quality_metrics', {})}")
-                return chunks
-        except Exception as e:
-            logger.warning(f"Enhanced chunking failed: {e}")
-    
     # Strategy 1: Try smart policy-aware chunking first (fastest)
     try:
         chunks = smart_policy_split(text, chunk_size, chunk_overlap)
@@ -187,49 +159,29 @@ def semantic_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) 
         logger.warning(f"Smart policy chunking failed: {e}")
     
     # Strategy 2: Try semantic chunking with timeout (medium speed)
+    # Semantic chunking is expensive; try only if previous strategies failed
     try:
-        logger.info("Attempting semantic chunking with timeout...")
-        
-        # Set a timeout for semantic chunking
-        import signal
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Semantic chunking timed out")
-        
-        # Try Ollama embeddings with timeout
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(10)  # 10 second timeout
-        
+        logger.info("Attempting semantic chunking (fallback)")
+        # Lazy import of semantic chunker to avoid heavy startup cost
+        from langchain_experimental.text_splitter import SemanticChunker
+        from langchain_ollama import OllamaEmbeddings
         try:
             embeddings = OllamaEmbeddings(model="all-minilm:33m")
             logger.info("Using Ollama embeddings for semantic chunking")
-        except Exception as e:
-            logger.warning(f"Ollama embeddings failed: {e}")
-            embeddings = OpenAIEmbeddings(
-                base_url="http://127.0.0.1:11434/",
-                model="all-minilm:33m",
-                api_key="ollama",
-            )
-            logger.info("Using OpenAI-compatible embeddings")
-        
-        # Create semantic chunker
+        except Exception:
+            from langchain_openai import OpenAIEmbeddings
+            embeddings = OpenAIEmbeddings()
+
         semantic_chunker = SemanticChunker(embeddings=embeddings)
         doc = LangChainDocument(page_content=text)
-        chunks = semantic_chunker.split_documents([doc])
-        
-        signal.alarm(0)  # Cancel timeout
-        
-        # Extract text content
-        text_chunks = [chunk.page_content for chunk in chunks if chunk.page_content.strip()]
-        
+        chunks_docs = semantic_chunker.split_documents([doc])
+        text_chunks = [c.page_content for c in chunks_docs if c.page_content.strip()]
         if text_chunks:
             elapsed = time.time() - start_time
             logger.info(f"Semantic chunking successful: {len(text_chunks)} chunks in {elapsed:.2f}s")
             return text_chunks
-            
-    except (TimeoutError, Exception) as e:
-        signal.alarm(0)  # Cancel timeout
-        logger.warning(f"Semantic chunking failed or timed out: {e}")
+    except Exception as e:
+        logger.warning(f"Semantic chunking failed: {e}")
     
     # Strategy 3: Fallback to fast rule-based splitting
     logger.info("Using fallback rule-based chunking")
@@ -240,7 +192,7 @@ def semantic_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) 
     return chunks
 
 # New enhanced functions that utilize the enhanced chunking framework
-def adaptive_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100, max_time: float = 10.0) -> List[str]:
+def adaptive_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200, max_time: float = 10.0) -> List[str]:
     """
     Adaptive splitting that intelligently chooses the best chunking strategy
     
@@ -262,14 +214,14 @@ def adaptive_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100, 
     # Fallback to smart policy split
     return smart_policy_split(text, chunk_size, chunk_overlap)
 
-def lightning_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
+def lightning_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
     """
     Ultra-fast chunking prioritizing speed over sophistication
     """
     logger.info("Using lightning-fast chunking...")
     
     # Simple but fast splitting using basic patterns
-    separators = ["\n\n\n", "\n\n", "\n", ". ", " "]
+    separators = ["\n\n", "\n", "Article", "Section", "Clause", ".", " "]
     
     chunks = []
     current_chunk = ""
@@ -305,10 +257,8 @@ def lightning_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int =
     logger.info(f"Lightning-fast chunking complete: {len(chunks)} chunks created")
     return chunks
 
-def smart_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
-    """
-    Fast chunking with policy document awareness
-    """
+def smart_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    """Fast chunking with policy document awareness"""
     if ENHANCED_CHUNKING_AVAILABLE:
         try:
             return policy_aware_split(text, chunk_size, chunk_overlap)
@@ -318,10 +268,8 @@ def smart_fast_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100
     # Fallback to original smart policy split
     return smart_policy_split(text, chunk_size, chunk_overlap)
 
-def contextual_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 100) -> List[str]:
-    """
-    Context-aware chunking that maintains semantic coherence
-    """
+def contextual_split(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    """Context-aware chunking that maintains semantic coherence"""
     if ENHANCED_CHUNKING_AVAILABLE:
         try:
             return hierarchical_split(text, chunk_size, chunk_overlap)
