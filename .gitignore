@@ -58,3 +58,4 @@ build/
 
 # Pinecone specific
 pinecone_index/
+.appmodconfig
