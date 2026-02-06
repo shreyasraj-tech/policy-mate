@@ -19,7 +19,8 @@ The Policy RAG system now uses **cosine similarity** with LangChain's **in-memor
 - In-memory vector store returns cosine distance (lower = more similar)
 - System automatically converts distance to similarity for clarity
 
-## 🚀 Usage Examples
+## 🚀 Usage Example
+
 
 ### Basic Query (Hybrid Mode)
 ```bash
